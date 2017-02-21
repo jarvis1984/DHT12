@@ -16,6 +16,7 @@
 #include <linux/gpio.h>
 #include <linux/string.h>
 #include <linux/kobject.h>
+#include <linux/mutex.h>
  
 /**
  * @defgroup MODULE_INFO
@@ -125,6 +126,15 @@ static struct attribute_group attr_group = {
 };
 
 static struct kobject *dht12_kobj;	///< kernel object
+
+/**
+ *  @brief DHT12 private data
+ */
+static struct dht12_private_t {
+	int ref;
+	struct mutex mtx;
+} dht12_data;
+
 /** @} */
 
 /** 
@@ -154,7 +164,7 @@ static struct kobject *dht12_kobj;	///< kernel object
 /** @brief the unit is micro second */
 #define ISQC_DELAY(x) udelay(x)
 /** @brief print debug message in debug mode */
-#define ISQC_DEBUG(x) debug ? printk(KERN_INFO "DBG:"x) : debug
+#define ISQC_DEBUG(...) debug ? printk(KERN_INFO "DBG:"__VA_ARGS__) : debug
 
 /**@brief
  * a complete cycle to write a bit to device
@@ -229,7 +239,7 @@ static struct kobject *dht12_kobj;	///< kernel object
                         ISQC_SET_SCL(ISQC_HIGH_LEVEL); \
                         ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE); \
                         if (ISQC_GET_SDA() != ISQC_LOW_LEVEL){ISQC_SEND_NACK(); \
-                        ISQC_SET_INPUT_PIN(); return 0;}
+                        ISQC_SET_INPUT_PIN(); goto out;}
                         
 /**@brief
  * send a ack signal to device
@@ -254,6 +264,8 @@ static int dev_open(struct inode *inodep, struct file *filep){
 	gpio_direction_input(ISQC_SCL);
 	gpio_request(ISQC_SDA, "I2C DATA");
 	gpio_direction_input(ISQC_SDA);
+	filep->private_data = &dht12_data;
+	dht12_data.ref++;
 	
    	return 0;
 }
@@ -268,16 +280,21 @@ static int dev_open(struct inode *inodep, struct file *filep){
 static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *offset){
 	ISQC_DEBUG("dev_read()\n");
 	
+	if (!mutex_trylock(&((struct dht12_private_t *)(filep->private_data))->mtx))
+		return 0;
+	
 	int dev = ISQC_DHT12_ADR + ISQC_WRITE_CMD;
 	int adr = 0x0;
+	ssize_t ret = 0;
 	ISQC_SET_INPUT_PIN();
 
 	if (ISQC_GET_SCL() == ISQC_LOW_LEVEL || ISQC_GET_SDA() == ISQC_LOW_LEVEL) //some device is working
 	{
 		ISQC_DEBUG("busy\n");
-		return 0;
+		goto out;
 	}
 
+	ISQC_DEBUG("write address\n");
 	/**
 	 * start flag
 	 */
@@ -308,6 +325,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	/*
 	 * read device
 	 */
+	ISQC_DEBUG("read registers\n");
 	dev = ISQC_DHT12_ADR + ISQC_READ_CMD;  
 
 	/**
@@ -393,9 +411,7 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE);
 
 	ISQC_SET_INPUT_PIN();
-	
-	if (debug)
-		printk(KERN_INFO "humInt:%d humFlt:%d tmpInt:%d tmpFlt:%d chkSum:%d\n", humInt, humFlt, tmpInt, tmpFlt, chkSum);
+	ISQC_DEBUG("humInt:%d humFlt:%d tmpInt:%d tmpFlt:%d chkSum:%d\n", humInt, humFlt, tmpInt, tmpFlt, chkSum);
 
 	if (chkSum == humInt + humFlt + tmpInt + tmpFlt)
 	{
@@ -406,11 +422,14 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 		value[ISQC_DHT12_CHKSUM] = chkSum;
 		
 		copy_to_user(buffer, value, ISQC_DHT12_BYTES);
-		return ISQC_DHT12_BYTES;
+		ret = ISQC_DHT12_BYTES;
+		goto out;
 	}
 	
 	ISQC_DEBUG("check sum error\n");
-	return 0;
+out:
+	mutex_unlock(&((struct dht12_private_t *)(filep->private_data))->mtx);
+	return ret;
 }
  
 /** 
@@ -438,6 +457,7 @@ static int dev_release(struct inode *inodep, struct file *filep){
 	
 	gpio_free(ISQC_SDA);
 	gpio_free(ISQC_SCL);
+	dht12_data.ref--;
    	return 0;
 }
 
@@ -501,6 +521,9 @@ static int __init dht_init(void){
 	  printk(KERN_ALERT "dht_init() failed to create the device\n");
 	  return PTR_ERR(dhtDevice);
 	}
+	
+	dht12_data.ref = 0;
+	mutex_init(&dht12_data.mtx);
 	
 	printk(KERN_INFO "dht_init: device class created correctly\n");
     return 0;
