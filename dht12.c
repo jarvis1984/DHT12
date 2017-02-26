@@ -2,8 +2,8 @@
  *  @file dht12.c
  *  @author JarvisWang
  *  @brief This is a i2c driver for dht12 sensor.
- *  This dirver simply use delay function to control timing of signals,
- *  so that the transferring rate could not be high(25KHZ) because of interrupts
+ *  Functions like detection of clock stretching and spinlock to disable irq are provided,
+ *  but the transferring rate could just reach 50khz due to the overhead of gpio functions
  */
 
 #include <linux/init.h>           
@@ -17,6 +17,8 @@
 #include <linux/string.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/spinlock_types.h>
  
 /**
  * @defgroup MODULE_INFO
@@ -25,7 +27,7 @@
 MODULE_LICENSE("GPL");              		
 MODULE_AUTHOR("JarvisWang");      				
 MODULE_DESCRIPTION("A DHT12 I2C driver");  	
-MODULE_VERSION("0.10");
+MODULE_VERSION("0.20");
 /** @} */
 
 /**
@@ -36,9 +38,6 @@ MODULE_VERSION("0.10");
 #define CLASS_NAME  "dht12"				///< The device class
 #define ISQC_SCL GPIOA(7)				///< Specify nanopi m1 GPIOA7(pin#32) to be the clock pin
 #define ISQC_SDA GPIOA(8)				///< Specify nanopi m1 GPIOA8(pin#33) to be the data pin
-#define ISQC_FORLOOP_PERCYCLE 40		///< Cycle time is 40 us, 25KHZ, dht12 recquire the rate to be less than 400KHZ
-#define ISQC_FORLOOP_HALFCYCLE ISQC_FORLOOP_PERCYCLE/2
-#define ISQC_FORLOOP_QUARTCYCLE ISQC_FORLOOP_PERCYCLE/4
 #define ISQC_DHT12_TEMP_INT 0x02
 #define ISQC_DHT12_TEMP_PNT 0x03
 #define ISQC_DHT12_HUMID_INT 0x00
@@ -56,9 +55,13 @@ MODULE_VERSION("0.10");
  *  @defgroup GLOBAL_VARIABLES
  *  @{
  */
-static int debug = 0;        					///< Execution mode, debug info will be printed when true
+static int debug = 0;        					///< Debug mode, debug info will be printed when true
 module_param(debug, int, (S_IRUSR | S_IWUSR)); 	///< Param desc. 
-MODULE_PARM_DESC(debug, "The execution mode");  ///< parameter description
+MODULE_PARM_DESC(debug, "The debug mode");  	///< parameter description
+
+static int cycle = 2;							///< Duty cycle, the unit is us
+module_param(cycle, int, (S_IRUSR | S_IWUSR)); 	///< Param desc. 
+MODULE_PARM_DESC(cycle, "The duty cycle");  	///< parameter description
 
 static int    majorNumber;                  	///< Stores the device number -- determined automatically
 static struct class*  dhtClass  = NULL; 		///< The device-driver class struct pointer
@@ -133,6 +136,7 @@ static struct kobject *dht12_kobj;	///< kernel object
 static struct dht12_private_t {
 	int ref;
 	struct mutex mtx;
+	spinlock_t spLock;
 } dht12_data;
 
 /** @} */
@@ -164,32 +168,34 @@ static struct dht12_private_t {
 /** @brief the unit is micro second */
 #define ISQC_DELAY(x) udelay(x)
 /** @brief print debug message in debug mode */
-#define ISQC_DEBUG(...) debug ? printk(KERN_INFO "DBG:"__VA_ARGS__) : debug
+#define ISQC_DEBUG(...) debug = debug && printk(KERN_INFO "DBG:"__VA_ARGS__)
+/** @brief check if clock is stretched */
+#define ISQC_CHECK_SCL() ISQC_SET_SCL_IN(); while(ISQC_GET_SCL() == ISQC_LOW_LEVEL)
 
 /**@brief
  * a complete cycle to write a bit to device
  * start from the time allowed to write value
  * end with the time allowed to write value, either
  */
-#define ISQC_WRITE_BIT(n, x) ISQC_SET_SCL(ISQC_LOW_LEVEL); \
-                             ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE); \
+#define ISQC_WRITE_BIT(n, x) ISQC_SET_SCL_OUT(ISQC_LOW_LEVEL); \
                              ISQC_SET_SDA(ISQC_BIT##n(x)); \
-                             ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE); \
-                             ISQC_SET_SCL(ISQC_HIGH_LEVEL); \
-                             ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE); \
+                             ISQC_DELAY(cycle); \
+                             ISQC_CHECK_SCL(); \
+							 ISQC_SET_SCL_OUT(ISQC_HIGH_LEVEL); \
+							 ISQC_DELAY(cycle)
+
 /**@brief
  * write a byte to device
  * start from msb
  */                               
-#define ISQC_WRITE_BYTE(x) ISQC_SET_OUTPUT_PIN(); \
-                           ISQC_WRITE_BIT(7, x); \
+#define ISQC_WRITE_BYTE(x) ISQC_WRITE_BIT(7, x); \
                            ISQC_WRITE_BIT(6, x); \
                            ISQC_WRITE_BIT(5, x); \
                            ISQC_WRITE_BIT(4, x); \
                            ISQC_WRITE_BIT(3, x); \
                            ISQC_WRITE_BIT(2, x); \
                            ISQC_WRITE_BIT(1, x); \
-                           ISQC_WRITE_BIT(0, x);
+                           ISQC_WRITE_BIT(0, x)
 
 /**@brief
  * a complete cycle to read a bit from device
@@ -197,13 +203,13 @@ static struct dht12_private_t {
  * end with the time allowed to read value, either
  * SCL and SDA must be input pin first
  */
-#define ISQC_READ_BIT(n, x) ISQC_SET_SCL(ISQC_LOW_LEVEL); \
-                            ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE); \
-                            ISQC_SET_SCL(ISQC_HIGH_LEVEL); \
-                            ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE); \
+#define ISQC_READ_BIT(n, x) ISQC_SET_SCL_OUT(ISQC_LOW_LEVEL); \
+                            ISQC_DELAY(cycle); \
+							ISQC_CHECK_SCL(); \
+							ISQC_SET_SCL_OUT(ISQC_HIGH_LEVEL); \
+							ISQC_DELAY(cycle); \
                             if (ISQC_GET_SDA()) x |= (0x01 << n); \
-                            else x &= ~(0x01 << n); \
-                            ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE);
+                            else x &= ~(0x01 << n)
 
 /**@brief
  * read a byte to device
@@ -218,7 +224,7 @@ static struct dht12_private_t {
                           ISQC_READ_BIT(3, x); \
                           ISQC_READ_BIT(2, x); \
                           ISQC_READ_BIT(1, x); \
-                          ISQC_READ_BIT(0, x);
+                          ISQC_READ_BIT(0, x)
 
 /**@brief
  * send a nack signal to device to end communication
@@ -226,30 +232,30 @@ static struct dht12_private_t {
 #define ISQC_SEND_NACK() ISQC_SET_OUTPUT_PIN(); \
                          ISQC_SET_SCL(ISQC_LOW_LEVEL); \
                          ISQC_SET_SDA(ISQC_HIGH_LEVEL); \
-                         ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE); \
+                         ISQC_DELAY(cycle); \
                          ISQC_SET_SCL(ISQC_HIGH_LEVEL); \
-                         ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
+                         ISQC_DELAY(cycle)
 
 /**@brief
  * wait a ack signal from device, or return a nack signal
  */
-#define ISQC_WAIT_ACK() ISQC_SET_SCL(ISQC_LOW_LEVEL); \
-                        ISQC_SET_SDA_IN(); \
-                        ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE); \
-                        ISQC_SET_SCL(ISQC_HIGH_LEVEL); \
-                        ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE); \
-                        if (ISQC_GET_SDA() != ISQC_LOW_LEVEL){ISQC_SEND_NACK(); \
-                        ISQC_SET_INPUT_PIN(); goto out;}
+#define ISQC_WAIT_ACK() ISQC_SET_SCL_OUT(ISQC_LOW_LEVEL); \
+						ISQC_SET_SDA_IN(); \
+                        ISQC_DELAY(cycle); \
+						ISQC_CHECK_SCL(); \
+						ISQC_SET_SCL_OUT(ISQC_HIGH_LEVEL); \
+						ISQC_DELAY(cycle); \
+                        if (ISQC_GET_SDA() != ISQC_LOW_LEVEL) \
+						do {ISQC_SEND_NACK(); goto brk;} while(0)
                         
 /**@brief
  * send a ack signal to device
  */  
-#define ISQC_SEND_ACK() ISQC_SET_SCL(ISQC_LOW_LEVEL); \
-						ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE); \
+#define ISQC_SEND_ACK() ISQC_SET_SCL_OUT(ISQC_LOW_LEVEL); \
 						ISQC_SET_SDA_OUT(ISQC_LOW_LEVEL);\
-                        ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE); \
+                        ISQC_DELAY(cycle); \
                         ISQC_SET_SCL(ISQC_HIGH_LEVEL); \
-                        ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
+                        ISQC_DELAY(cycle)
 /** @} */
 
 /** 
@@ -260,9 +266,14 @@ static struct dht12_private_t {
 static int dev_open(struct inode *inodep, struct file *filep){
    	ISQC_DEBUG("dev_open()\n");
 	
-	gpio_request(ISQC_SCL, "I2C CLOCK");
+	if (gpio_request(ISQC_SCL, "I2C CLOCK"))
+		return -EBUSY;
+	if (gpio_request(ISQC_SDA, "I2C DATA"))
+	{
+		gpio_free(ISQC_SCL);
+		return -EBUSY;
+	}
 	gpio_direction_input(ISQC_SCL);
-	gpio_request(ISQC_SDA, "I2C DATA");
 	gpio_direction_input(ISQC_SDA);
 	filep->private_data = &dht12_data;
 	dht12_data.ref++;
@@ -286,6 +297,8 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	int dev = ISQC_DHT12_ADR + ISQC_WRITE_CMD;
 	int adr = 0x0;
 	ssize_t ret = 0;
+	spinlock_t *pLock = &((struct dht12_private_t *)(filep->private_data))->spLock;
+		
 	ISQC_SET_INPUT_PIN();
 
 	if (ISQC_GET_SCL() == ISQC_LOW_LEVEL || ISQC_GET_SDA() == ISQC_LOW_LEVEL) //some device is working
@@ -299,12 +312,12 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	 * start flag
 	 */
 	ISQC_SET_SDA_OUT(ISQC_LOW_LEVEL);
-	//ISQC_SET_SDA(ISQC_LOW_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
-
+	ISQC_DELAY(cycle);
+	
 	/*
 	 * send slave address to write
 	 */
+	spin_lock_irq(pLock);
 	ISQC_WRITE_BYTE(dev);
 
 	/*
@@ -315,12 +328,14 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	/*
 	 * send register address to read
 	 */
+	ISQC_SET_SDA_OUT(ISQC_LOW_LEVEL);
 	ISQC_WRITE_BYTE(adr);
 
 	/*
 	 * wait ack
 	 */
 	ISQC_WAIT_ACK();
+	spin_unlock_irq(pLock);
 
 	/*
 	 * read device
@@ -331,17 +346,19 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	/**
 	 * start again
 	 */
-	ISQC_SET_SCL(ISQC_LOW_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
+	ISQC_SET_SCL_OUT(ISQC_LOW_LEVEL);
+	ISQC_DELAY(cycle);
 	ISQC_SET_SDA_OUT(ISQC_HIGH_LEVEL);
-	ISQC_SET_SCL(ISQC_HIGH_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
+	ISQC_CHECK_SCL();
+	ISQC_SET_SCL_OUT(ISQC_HIGH_LEVEL);
+	ISQC_DELAY(cycle);
 	ISQC_SET_SDA(ISQC_LOW_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
+	ISQC_DELAY(cycle);
 
 	/*
 	 * send slave address to read
 	 */
+	spin_lock_irq(pLock);
 	ISQC_WRITE_BYTE(dev);
 
 	/*
@@ -398,19 +415,19 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	 * send nack
 	 */
 	ISQC_SEND_NACK();
+	spin_unlock_irq(pLock);
 
 	/*
 	 * send stop
 	 */
 	ISQC_SET_SCL(ISQC_LOW_LEVEL);
 	ISQC_SET_SDA(ISQC_LOW_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_HALFCYCLE);
+	ISQC_DELAY(cycle);
 	ISQC_SET_SCL(ISQC_HIGH_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE);
+	ISQC_DELAY(cycle);
 	ISQC_SET_SDA(ISQC_HIGH_LEVEL);
-	ISQC_DELAY(ISQC_FORLOOP_QUARTCYCLE);
+	ISQC_DELAY(cycle);
 
-	ISQC_SET_INPUT_PIN();
 	ISQC_DEBUG("humInt:%d humFlt:%d tmpInt:%d tmpFlt:%d chkSum:%d\n", humInt, humFlt, tmpInt, tmpFlt, chkSum);
 
 	if (chkSum == humInt + humFlt + tmpInt + tmpFlt)
@@ -427,9 +444,14 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
 	}
 	
 	ISQC_DEBUG("check sum error\n");
+	
 out:
 	mutex_unlock(&((struct dht12_private_t *)(filep->private_data))->mtx);
+	ISQC_SET_INPUT_PIN();
 	return ret;
+brk:
+	spin_unlock_irq(pLock);
+	goto out;
 }
  
 /** 
@@ -443,7 +465,7 @@ out:
  */
 static ssize_t dev_write(struct file *filep, const char *buffer, size_t len, loff_t *offset){
    ISQC_DEBUG("dev_write()\n");
-   return EBADF;
+   return -EBADF;
 }
  
 /** 
@@ -522,8 +544,12 @@ static int __init dht_init(void){
 	  return PTR_ERR(dhtDevice);
 	}
 	
+	/**
+	 * Init private device data
+	 */
 	dht12_data.ref = 0;
 	mutex_init(&dht12_data.mtx);
+	spin_lock_init(&dht12_data.spLock);
 	
 	printk(KERN_INFO "dht_init: device class created correctly\n");
     return 0;
