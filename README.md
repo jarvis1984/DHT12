@@ -8,8 +8,21 @@ with Debian OS installed.<br>
 - GPIOA8(pin#33) is assigned to be the data pin(SDA)
 
 ## Test Result
-- Currently, the transferring rate could only be 25KHZ, more or less
-![](https://github.com/jarvis1984/DHT12/blob/master/2017-02-20-234443_1600x900_scrot.png)
+- The transferring rate could reach about 50KHZ
+![](https://github.com/jarvis1984/DHT12/blob/master/2017-02-26-210826_1600x900_scrot.png)
+
+## STEPS
+- V0.1 SIMPLE LOGIC
+  - Use kernel delay functions to control the timimg of signals
+  - The transferring rate is about 25KHZ
+  - Higher rates will be disturbed by clock stretching
+
+- V0.2 SPEEDING UP
+  - Detection of clock stretching is provided
+  - Use spinlock to disable interrupts
+  - The rate could reach 50KHZ
+  - The overhead of gpio functions to detect clock is too high,
+    so that the cycle time is too long
 
 ## License
 This `DHT12 driver` is freely redistributable under the BSD License.
