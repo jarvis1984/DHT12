@@ -11,7 +11,7 @@ with Debian OS installed.<br>
 - The transferring rate could reach about 50KHZ
 ![](https://github.com/jarvis1984/DHT12/blob/master/2017-02-26-210826_1600x900_scrot.png)
 
-## STEPS
+## HISTORY
 - V0.1 SIMPLE LOGIC
   - Use kernel delay functions to control the timimg of signals
   - The transferring rate is about 25KHZ
